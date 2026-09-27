@@ -50,6 +50,7 @@ import {
 import {
   loadGroupBalancesWithSuggestions,
   groupPrimaryAsset,
+  verifySettlementLimit,
 } from "../services/group-balances";
 import { validateAsset, validateAmount } from "../services/assets";
 import { refineStellarAsset, stellarAmountSchema } from "../lib/stellar-validation";
@@ -162,6 +163,14 @@ export default async function settlementRoutes(app: FastifyInstance) {
           throw Errors.conflict("already_settled", "Your share is already settled");
         }
 
+        await verifySettlementLimit(
+          tx,
+          expense.groupId,
+          auth.id,
+          expense.payerUserId,
+          myShare.shareAmount.toString()
+        );
+
         const code = shortCode();
         const { expiresAt, validitySeconds } = intentExpiry(body.validitySeconds);
         const settlement = await tx.settlement.create({
@@ -251,6 +260,14 @@ export default async function settlementRoutes(app: FastifyInstance) {
       resourceId: groupId,
       payload: body,
       operation: async (tx) => {
+        await verifySettlementLimit(
+          tx,
+          groupId,
+          auth.id,
+          body.toUserId,
+          body.amount
+        );
+
         const code = shortCode();
         const { expiresAt, validitySeconds } = intentExpiry(body.validitySeconds);
         const settlement = await tx.settlement.create({

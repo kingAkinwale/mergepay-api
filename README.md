@@ -11,7 +11,8 @@ integration, treasury multisig, anchor (SEP-24) flows, and background jobs.
 [Web repo](https://github.com/mergepay/mergepay-web) ·
 [API repo](https://github.com/mergepay/mergepay-api)
 
-![CI](https://github.com/mergepay/mergepay-api/actions/workflows/ci.yml/badge.svg)
+[![CI](https://github.com/mergepay/mergepay-api/actions/workflows/ci.yml/badge.svg)](https://github.com/mergepay/mergepay-api/actions/workflows/ci.yml)
+[![TypeScript](https://img.shields.io/badge/TypeScript-strict%20mode-3178C6?logo=typescript&logoColor=white)](https://github.com/mergepay/mergepay-api/blob/main/tsconfig.json)
 ![License](https://img.shields.io/github/license/mergepay/mergepay-api)
 ![Stellar](https://img.shields.io/badge/stellar-testnet-blueviolet)
 
@@ -87,6 +88,8 @@ its own SEP-10 signing key.
 
 ## Setup
 
+For the quickest local dev path against Stellar testnet, see [docs/LOCAL_SETUP.md](docs/LOCAL_SETUP.md).
+
 ```bash
 git clone https://github.com/mergepay/mergepay-api.git
 cd mergepay-api
@@ -108,6 +111,70 @@ npm run dev                   # API on :4000
 npm run worker                # background reconciliation worker (separate shell)
 ```
 
+### Local database setup
+
+For local development, use PostgreSQL 14+ and Node.js 20+. Start PostgreSQL,
+then create the `mergepay` database once:
+
+```bash
+createdb mergepay
+```
+
+Copy `.env.example` to `.env` if you have not already, and set `DATABASE_URL`
+to a connection string for that database, for example:
+
+```env
+DATABASE_URL=postgresql://postgres:your-password@localhost:5432/mergepay
+```
+
+Generate the Prisma client and apply the migrations to initialize the schema:
+
+```bash
+npm run prisma:generate
+npm run prisma:migrate
+```
+
+To add the local development seed data, run:
+
+```bash
+npm run db:seed
+```
+
+### Seed data
+
+`npm run db:seed` runs [prisma/seed.ts](prisma/seed.ts) and populates a
+disposable demo dataset so API endpoints can be exercised immediately, without
+manual bootstrapping. The script is **idempotent**: every row is written with
+an upsert keyed by a deterministic id (or another natural unique key), so
+running it again never throws a unique constraint violation and never
+duplicates data. A re-run also restores any seed-owned row to its canonical
+demo values. Rows left behind by older versions of the seed (random ids) are
+untouched — delete them by hand if you want a clean slate.
+
+| Row | Details |
+| --- | --- |
+| Users | `Ada`, `Kola`, `Zo`, `Tunde` — deterministic testnet keypairs |
+| Groups | `Lagos Trip` (4 members) and `Flat 12B` (3 members, treasury enabled) |
+| Expenses | `Dinner` (equal), `Airport transfer` (equal), `Groceries` (custom split), `Wi-Fi subscription` (equal) |
+| Settlements | `SEEDSETTLE` confirmed, `SEEDQUEUE2` pending signature, `SEEDRETRY2` failed and retryable — each with status history |
+| Treasury | confirmed deposit `SEEDTREASR` (100 XLM) and pending deposit `SEEDGRANT2` (50 XLM) in `Flat 12B` |
+| Invite | code `SEEDCLUB` for `Lagos Trip` (max 10 uses) |
+
+The demo accounts are derived from public labels (`mergepay:demo:…`), so their
+secret keys are recomputable by anyone: use them only in local or testnet
+databases and never fund them with anything of value. To sign demo
+transactions (for example in Stellar Laboratory), print the secret seeds with:
+
+```bash
+SEED_PRINT_SECRETS=1 npm run db:seed
+```
+
+Seeded intents carry `expiresAt = null`, which the API reads as "no recorded
+deadline", so demo rows stay actionable instead of expiring while the database
+sits idle.
+
+New to the codebase? The typing standards enforced across `src/` are documented in [TypeScript strict mode](#typescript-strict-mode).
+
 ## Environment variables
 
 See [.env.example](.env.example). Key ones:
@@ -115,14 +182,84 @@ See [.env.example](.env.example). Key ones:
 | Variable | Description |
 | --- | --- |
 | `DATABASE_URL` | PostgreSQL connection string |
-| `JWT_SECRET` | Secret for signing session JWTs (12h expiry) |
+| `JWT_SECRET` | Secret for signing session JWTs (default 15min expiry, configurable via `ACCESS_TOKEN_TTL_SECONDS`) |
+| `JWT_ISSUER` | JWT issuer claim (default: `mergepay-api`) |
+| `JWT_AUDIENCE` | JWT audience claim (default: `mergepay-app`) |
+| `ACCESS_TOKEN_TTL_SECONDS` | Access token lifetime in seconds (default: 900 / 15 minutes) |
+| `REFRESH_TOKEN_TTL_MS` | Refresh token lifetime in milliseconds (default: 30 days) |
 | `STELLAR_NETWORK` | `testnet` or `public` |
 | `HORIZON_URL` | Horizon server |
 | `SEP10_SIGNING_SECRET` | Server's SEP-10 signing key (`npm run gen:sep10key`) |
-| `WEB_URL` | Frontend origin (CORS + invite links) |
+| `WEB_URL` | Frontend origin allow-list for CORS + invite links (comma-separated; `*` for local dev) |
 | `ANCHOR_HOME_DOMAIN` | SEP-24 anchor home domain (default SDF test anchor) |
 | `ANCHOR_WEBHOOK_SECRET` | Shared secret for the anchor webhook |
 | `STABLE_ASSET_CODE` / `STABLE_ASSET_ISSUER` | Stable asset for settlement |
+
+#### CORS configuration
+
+Cross-origin access for the frontend (`mergepay-web`) is configured entirely
+from the environment: `src/app.ts` registers `@fastify/cors` with the options
+built by `src/lib/cors.ts`. Preflights are answered `204` inside the plugin's
+`onRequest` hook — ahead of authentication and rate limiting — because a
+browser never sends an `Authorization` header on an `OPTIONS` probe.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `WEB_URL` | `""` (deny cross-origin) | Origin allow-list, comma-separated; `*` reflects any origin and is for local development only (the shipped `.env.example` sets `*`) |
+| `CORS_ALLOW_CREDENTIALS` | `false` | Whether cross-origin requests may carry credentials; never enable alongside `WEB_URL=*` outside local development |
+| `CORS_ALLOW_METHODS` | `GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS` | Methods advertised on a preflight — restricted to this list, never echoed from the request |
+| `CORS_ALLOW_HEADERS` | `Content-Type,Authorization,X-Requested-With,Idempotency-Key` | Request headers a cross-origin request may send |
+| `CORS_EXPOSE_HEADERS` | `X-Request-ID,X-Correlation-ID,X-RateLimit-*`,`Retry-After` | Response headers made readable to the caller |
+| `CORS_MAX_AGE` | `86400` | Preflight cache lifetime in seconds |
+
+An empty `WEB_URL` denies every cross-origin request while leaving same-origin
+and non-browser clients (no `Origin` header) to the routes' own
+authentication. If `WEB_URL` names a `*.vercel.app` host, preview deployments
+of the frontend (`mergepay-web-*.vercel.app`) are allowed too.
+
+#### Horizon read retries
+
+Read-only Horizon calls (currently fee statistics) retry transient failures —
+timeouts, connection resets, and selected 5xx responses — with bounded,
+configurable backoff so a temporary upstream blip does not immediately fail a
+recoverable read. Transaction submission is **never** transparently retried by
+this helper.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `HORIZON_READ_RETRY_MAX_ATTEMPTS` | 3 | Total attempts (including the first) for a transiently failing read |
+| `HORIZON_READ_RETRY_INITIAL_DELAY_MS` | 250 | Backoff before the first retry |
+| `HORIZON_READ_RETRY_MAX_DELAY_MS` | 2000 | Cap on the exponential backoff |
+
+#### Upstream retry configuration
+
+General retry configuration for safe Horizon and anchor reads (see `src/services/retry.ts`):
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `UPSTREAM_RETRY_MAX_ATTEMPTS` | 3 | Total retry attempts for safe upstream calls |
+| `UPSTREAM_RETRY_INITIAL_DELAY_MS` | 200 | Initial delay before first retry |
+| `UPSTREAM_RETRY_MAX_DELAY_MS` | 2000 | Maximum delay cap for exponential backoff |
+| `UPSTREAM_RETRY_JITTER_RATIO` | 0.25 | Fraction of delay applied as random jitter |
+| `HORIZON_RETRY_ON_RATE_LIMIT` | true | Horizon reads in `src/services/stellar.ts` also retry HTTP 429 (honouring `Retry-After` up to `UPSTREAM_RETRY_MAX_DELAY_MS`). Submissions are never retried. |
+
+#### Idempotency configuration
+
+Idempotency for `POST /api/settlements/execute` prevents duplicate submissions:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `IDEMPOTENCY_TTL_MS` | 86400000 (24h) | How long a completed reservation replays its stored status |
+| `IDEMPOTENCY_IN_PROGRESS_TIMEOUT_MS` | 60000 (1m) | Timeout for in-progress reservations before they can be reclaimed |
+
+#### SEP-24 webhook configuration
+
+Configuration for SEP-24 anchor callbacks (`POST /api/webhooks/sep24`):
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `SEP24_WEBHOOK_SECRETS` | "" | Per-anchor HMAC secrets as "anchorName:secret,anchorName:secret" |
+| `SEP24_WEBHOOK_TOLERANCE_MS` | 300000 (5m) | Maximum timestamp deviation allowed for anchor callbacks |
 
 ### Rate limiting
 
@@ -200,19 +337,37 @@ validator runs efficiently.
 
 ### Worker job tracking and recovery
 
-The background worker tracks job claims and retry attempts for settlement
-submissions and anchor polling. In the event of a worker crash or deployment
-interruption, stale jobs (claimed for longer than 15 minutes) are automatically
-recovered and re-eligible for processing. Job state is tracked via:
+The background worker drives settlement submission and SEP-24 anchor polling
+with the same claim-based rules (see `src/worker/index.ts`):
 
-- `jobAttemptCount`: Number of times the job has been claimed for processing
-- `jobClaimedAt`: Timestamp when the job was last claimed (null if released)
-- `jobEligibleAt`: Earliest time the job is eligible for the next retry attempt
-- `jobErrorSummary`: Truncated error message from the last attempt (for operator review)
+- **Claim before work.** A job is claimed with a conditional update that writes
+  a lease (`claimedBy`, `leaseExpiresAt`). Two workers can never drive the same
+  transition. A crashed process leaves its lease behind; at the top of every
+  cycle `recoverStaleSettlements()`/`recoverStaleAnchorSessions()` free
+  expired leases (default lease timeout: `WORKER_LEASE_TIMEOUT_MS`, 60s), so a
+  restart resumes work without duplicating it.
+- **Classify before retrying.** Every failure is categorised by
+  `src/services/job-retry.ts` into `transient` (rate limits, outages — safe to
+  retry), `indeterminate` (timeout, dropped socket — the worker checks Horizon
+  by the envelope's deterministic hash *before* resubmitting, so an already
+  applied transaction is never submitted twice), and `permanent` (rejected
+  transaction, expired intent, authorization — no retry, the job fails).
+- **Persist the job state.** Attempts, the next eligible time, the failure
+  category, and the final reason are columns on the row (`retryCount`,
+  `nextAttemptAt`, `errorCategory`, `failureReason`), never process memory.
+  An exhausted job stops retrying and is marked `failed` with a sanitized
+  reason; retries and failures are also recorded in the audit log / status
+  history.
 
-Terminal failures (exhausted retries, permanent errors) are marked with status
-`failed` and retain an error summary for support investigation. Each job has
-a maximum of 5 attempts with exponential backoff (5s, 30s, 5m, 30m, 60m).
+Retry budgets are exponential with jitter and fully configurable via env vars
+(see `.env.example`):
+
+- `WORKER_SETTLEMENT_MAX_ATTEMPTS` (default 3), `WORKER_SETTLEMENT_RETRY_INITIAL_DELAY_MS`
+  (default 1000), `WORKER_SETTLEMENT_RETRY_MAX_DELAY_MS` (default 30000),
+  `WORKER_SETTLEMENT_RETRY_JITTER_RATIO` (default 0.25)
+- `WORKER_ANCHOR_MAX_ATTEMPTS` (default 5), `WORKER_ANCHOR_RETRY_INITIAL_DELAY_MS`
+  (default 5000), `WORKER_ANCHOR_RETRY_MAX_DELAY_MS` (default 120000),
+  `WORKER_ANCHOR_RETRY_JITTER_RATIO` (default 0.25)
 
 ## How it works
 
@@ -278,6 +433,24 @@ treasury account and, when `treasuryRequiredSigners > 1`, returned in
 exchanges it for an anchor JWT and the interactive deposit/withdraw URL. A signed
 `POST /anchors/webhook` updates session status; the worker also polls.
 
+Status tracking (`src/services/anchor.ts`, `src/services/anchor-status.ts`):
+
+- `anchorService.getTransaction` reads `GET /transaction` and validates it with
+  the Zod schema in `src/services/anchor-schemas.ts`. `id`, `kind` and `status`
+  are required, unknown fields are stripped, and amounts stay decimal strings
+  (a malformed optional field is dropped and logged, never coerced). Failures
+  raise typed errors from `src/services/anchor-errors.ts`, all 502 over HTTP.
+  Each attempt is bounded by `ANCHOR_POLL_TIMEOUT_MS`, and transient failures
+  are retried per `UPSTREAM_RETRY_*`.
+- Every status change goes through `applyAnchorSessionTransition`: a
+  conditional update on the current status plus a `status_history` row and an
+  audit row, all in one transaction. Re-delivering the same status is a no-op,
+  terminal states (`completed`, `refunded`, `expired`, `no_market`,
+  `too_small`, `too_large`; `error` may still become `refunded`) are never
+  walked back, and concurrent writers record the transition exactly once.
+- A status outside the SEP-24 set is logged and ignored. The session keeps its
+  last known state and the worker keeps polling.
+
 ## Endpoints
 
 | Method | Path | Purpose |
@@ -294,6 +467,7 @@ exchanges it for an anchor JWT and the interactive deposit/withdraw URL. A signe
 | GET/POST | `/anchors` · `/anchors/deposit` · `/anchors/withdraw` · `/anchors/sessions/:id/complete` · `/anchors/sessions` · `/anchors/webhook` | Anchors |
 | GET | `/history` | Cross-group history |
 | POST/GET | `/uploads/receipt` · `/uploads/:file` | Receipts |
+| GET | `/health` · `/health/live` · `/health/ready` | Liveness & readiness probes (see [HEALTH.md](HEALTH.md)) |
 
 All request bodies are validated with Zod; every group action checks membership
 (and admin rights where required). The full contract — error envelope and codes,
@@ -331,6 +505,19 @@ Covers `GET /groups`, `/groups/:id/expenses`, `/groups/:id/ledger`,
 `/groups/:id/treasury/history`, `/anchors/sessions`, and `/history` (which
 paginates its expense and settlement streams independently, via `cursor` and
 `settlementCursor`).
+
+## TypeScript strict mode
+
+The whole of `src/` compiles under TypeScript's [`strict`](https://www.typescriptlang.org/tsconfig/#strict) flag — see [tsconfig.json](tsconfig.json) for the exact configuration. `strict` turns on every strict type-checking family at once (`strictNullChecks`, `noImplicitAny`, `strictFunctionTypes`, `strictBindCallApply`, `strictPropertyInitialization`, `noImplicitThis`, `alwaysStrict`, and `useUnknownInCatchVariables`), so `null`/`undefined` flows, implicit `any`s, and unbound `this` are compile errors rather than production incidents.
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `strict` | `true` | All strict checks on across `src/` — no per-file opt-outs |
+| `forceConsistentCasingInFileNames` | `true` | Casing differences cannot break Linux CI builds |
+| `noUnusedLocals` | `false` | Deliberate: readability over lint-by-compiler (ESLint's `no-unused-vars` covers it) |
+| `noUncheckedIndexedAccess` | `false` | Deliberate: index accesses are guarded where they matter |
+
+CI enforces it: [`npm run build`](CONTRIBUTING.md#pr-checklist) must pass with zero TS errors before a PR merges. When contributing, keep new code strict-clean — narrow unknowns explicitly, annotate catch variables, and never suppress with `any` casts where a real type exists (see [CONTRIBUTING.md](CONTRIBUTING.md#coding-standards)).
 
 ## Testing
 

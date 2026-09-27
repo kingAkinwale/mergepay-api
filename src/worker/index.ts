@@ -88,11 +88,27 @@ import {
   loggerWithContext,
 } from "../lib/correlation";
 import { jobLogger, type JobLogger } from "../lib/worker-logger";
+import {
+  CYCLE_TASK_RETRY_POLICY,
+  getWorkerHealth,
+  initWorkerHealth,
+  logHealthCritical,
+  logHealthHeartbeat,
+  recordCycleFailure,
+  recordCycleStart,
+  recordCycleSuccess,
+  recordTaskDeadLetter,
+  recordTaskFailure,
+  withRetry,
+} from "./health";
 
 const log = pino({ name: "worker" });
 
 /** Identifies this process in job leases, so it can release its own claims. */
 const WORKER_ID = randomUUID();
+
+// Bind the health registry to this process once, at module load.
+initWorkerHealth(WORKER_ID);
 
 /** Total submission attempts per settlement, including the first. */
 export const SETTLEMENT_MAX_RETRIES = SETTLEMENT_RETRY_POLICY.maxAttempts;
@@ -1320,6 +1336,61 @@ export async function expireStaleTreasuryProposals(): Promise<void> {
   }
 }
 
+/**
+ * Run one cycle task under the issue-#708 retry wrapper.
+ *
+ * A transient database or Horizon error is retried in-cycle with bounded,
+ * jittered exponential backoff. When the budget is exhausted the failure is
+ * *recorded* (health counters) and *logged as critical* — the dead-letter
+ * signal for a sweep task, which keeps no row of its own — and the cycle
+ * continues: one failing task must not starve the other eight.
+ */
+async function runCycleTask<T>(
+  taskName: string,
+  task: () => Promise<T>
+): Promise<void> {
+  try {
+    await withRetry(task, {
+      taskName,
+      policy: CYCLE_TASK_RETRY_POLICY,
+      // The worker's injectable delay, so tests drive the backoff schedule
+      // without real time passing (same pattern as the settlement loop).
+      sleep: delayFn,
+      onRetry: ({ attempt, delayMs, reason }) => {
+        recordTaskFailure(taskName);
+        log.warn(
+          {
+            jobType: "worker_cycle",
+            task: taskName,
+            attempt,
+            maxAttempts: CYCLE_TASK_RETRY_POLICY.maxAttempts,
+            outcome: "retry_scheduled",
+            nextDelayMs: delayMs,
+            reason,
+          },
+          "worker cycle task retry scheduled"
+       );
+      },
+    });
+  } catch (error) {
+    // Budget exhausted (or a permanent/indeterminate failure): log critical,
+    // count it, and let the cycle go on. The `error` field carries the
+    // sanitized failure so log-based alerting sees the real cause.
+    recordTaskFailure(taskName);
+    recordTaskDeadLetter(taskName);
+    log.error(
+      {
+        jobType: "worker_cycle",
+        task: taskName,
+        outcome: "dead_letter",
+        reason: safeFailureMessage(error),
+      },
+      "worker cycle task exhausted its retry budget"
+    );
+    throw error;
+  }
+}
+
 export async function runWorkerCycle(): Promise<void> {
   const lease = await acquireWorkerLease(
     "mergepay:worker-cycle",
@@ -1331,26 +1402,57 @@ export async function runWorkerCycle(): Promise<void> {
     return;
   }
 
-  try {
-  // Recover first: a restart should adopt the previous process's work before
-  // looking for new jobs.
-  await Promise.allSettled([recoverStaleSettlements(), recoverStaleAnchorSessions()]);
+  // Health tracking (issue #708): the cycle is timed, its outcome recorded,
+  // and a structured heartbeat emitted on every run so log-based alerting can
+  // see the loop is alive (or that consecutive cycles keep failing).
+  recordCycleStart();
+  let failed = false;
 
-  await Promise.allSettled([
-    processSubmittedSettlements(),
-    reconcileAnchors(),
-    reconcilePendingSettlements(),
-    // Read-only status sync over pending transactions neither sibling claims:
-    // settlements whose confirmation poll was interrupted, and treasury
-    // intents someone may have submitted from their own wallet (issue #355).
-    syncPendingTransactionStatuses(),
-    reconcileAllTreasuryBalances(),
-    expireInvites(),
-    deliverPendingWebhooks(),
-    expireStaleTreasuryProposals(),
-    cleanupChallenges(),
-  ]);
+  try {
+    // Recover first: a restart should adopt the previous process's work before
+    // looking for new jobs. The recovery sweeps are cycle tasks like any other,
+    // so a transient database error during recovery is retried too.
+    await Promise.allSettled([
+      runCycleTask("recoverStaleSettlements", recoverStaleSettlements),
+      runCycleTask("recoverStaleAnchorSessions", recoverStaleAnchorSessions),
+    ]);
+
+    const taskResults = await Promise.allSettled([
+      runCycleTask("processSubmittedSettlements", processSubmittedSettlements),
+      runCycleTask("reconcileAnchors", reconcileAnchors),
+      runCycleTask("reconcilePendingSettlements", reconcilePendingSettlements),
+      // Read-only status sync over pending transactions neither sibling claims:
+      // settlements whose confirmation poll was interrupted, and treasury
+      // intents someone may have submitted from their own wallet (issue #355).
+      runCycleTask("syncPendingTransactionStatuses", syncPendingTransactionStatuses),
+      runCycleTask("reconcileAllTreasuryBalances", reconcileAllTreasuryBalances),
+      runCycleTask("expireInvites", expireInvites),
+      runCycleTask("deliverPendingWebhooks", deliverPendingWebhooks),
+      runCycleTask("expireStaleTreasuryProposals", expireStaleTreasuryProposals),
+      runCycleTask("cleanupChallenges", cleanupChallenges),
+    ]);
+
+    // A cycle is "failed" when any task exhausted its retry budget — exactly
+    // the tasks that were previously swallowed by allSettled with no trace.
+    failed = taskResults.some((r) => r.status === "rejected");
   } finally {
+    if (failed) {
+      recordCycleFailure("one or more cycle tasks exhausted their retry budget");
+    } else {
+      recordCycleSuccess();
+    }
+    logHealthHeartbeat(log);
+    if (
+      failed &&
+      getWorkerHealth().consecutiveFailures >=
+        config.WORKER_HEALTH_UNHEALTHY_THRESHOLD
+    )
+    {
+      logHealthCritical(
+        log,
+        "consecutive failed worker cycles reached the unhealthy threshold"
+      );
+    }
     await releaseWorkerLease(lease);
   }
 }

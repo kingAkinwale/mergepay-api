@@ -13,7 +13,9 @@
  *     the signature is computed over network-dependent bytes, so it cannot
  *     survive a passphrase swap.
  *  2. `validateChallengeEnvelope` re-checks the structure this server actually
- *     issues: server-sourced, sequence 0, no memo, real time bounds, one
+ *     issues: server-sourced, sequence 0, no memo, real time bounds (checked
+ *     explicitly against server time with clock-skew tolerance — expired,
+ *     not-yet-valid, and over-long windows each get their own code), one
  *     client-sourced `<home domain> auth` operation carrying a large enough
  *     nonce for a G... account, and exactly one server-sourced
  *     `web_auth_domain` entry — nothing else (`client_domain` is not
@@ -30,11 +32,14 @@
  * Failures are always a 401, but not one uniform message: a challenge that is
  * otherwise well-formed and correctly signed but arrived after its validity
  * window is rejected with the dedicated CHALLENGE_EXPIRED error so a client
- * knows the envelope was good and the only remedy is to request a fresh one.
- * Signature and domain failures stay the generic UNAUTHORIZED — distinguishing
- * them from expiry would hand an attacker a probe for which failures are
- * structural rather than temporal. The SDK's message, the challenge XDR, and
- * any signature material are never echoed back or logged either way.
+ * knows the envelope was good and the only remedy is to request a fresh one;
+ * a window that has not yet opened or that outlives the validity this server
+ * grants gets the sibling CHALLENGE_NOT_YET_VALID / CHALLENGE_WINDOW_TOO_LONG
+ * codes. Signature and domain failures stay the generic UNAUTHORIZED —
+ * distinguishing them from expiry would hand an attacker a probe for which
+ * failures are structural rather than temporal. The SDK's message, the
+ * challenge XDR, and any signature material are never echoed back or logged
+ * either way.
  *
  * Successful verification returns the client's public key; minting the session
  * token stays in src/routes/auth.ts, whose claims contract is unchanged.
@@ -122,6 +127,74 @@ function isValidAccount(account: string): boolean {
   return StrKey.isValidEd25519PublicKey(account);
 }
 
+/**
+ * The challenge carries a usable time-bound window, but the window is not the
+ * one this server issues: it starts beyond the clock-skew tolerance (a wallet
+ * signing a not-yet-valid envelope is holding a credential with no present
+ * value) or it outlives the validity this server grants. Both are structural
+ * mismatches between the envelope and what this server would have built,
+ * reported with their own 401 code so clients can tell them from the opaque
+ * structural failures below — without ever revealing *which* structural
+ * detail disagreed.
+ */
+function invalidChallengeWindow(reason: "not_yet_valid" | "window_too_long"): never {
+  if (reason === "not_yet_valid") {
+    throw Errors.challengeNotYetValid(
+      "Authentication challenge is not valid yet. Request a new challenge and sign it promptly."
+    );
+  }
+  throw Errors.challengeWindowTooLong(
+    "Authentication challenge window is longer than this server issues. Request a new challenge."
+  );
+}
+
+/**
+ * Explicitly check a challenge's time bounds against the current server time.
+ *
+ * This is the challenge-side counterpart of the signed-intent checks in
+ * src/lib/time-bounds.ts, kept separate because a challenge answers a
+ * different question: not "does this envelope match a stored intent" but "may
+ * this envelope still be redeemed right now". In order:
+ *
+ *  1. No usable bounds, or an unbounded envelope (`maxTime` 0) — rejected.
+ *     A challenge that never expires is not one this server built.
+ *  2. `maxTime` elapsed, granting `CLOCK_SKEW_TOLERANCE_SECONDS` of skew —
+ *     CHALLENGE_EXPIRED. The one failure a client can fix without debugging.
+ *  3. `minTime` not yet reached, granting the same skew — the window's floor.
+ *  4. A window longer than `CHALLENGE_VALIDITY_SECONDS` (skew granted on top)
+ *     — the envelope outlives anything this server issues.
+ *
+ * Split out from `validateChallengeEnvelope` so the contract is directly
+ * testable and future redemption paths cannot bypass it: every challenge
+ * verification must have passed these bounds against server time.
+ */
+export function validateChallengeTimeBounds(
+  bounds: TimeBounds | null,
+  now: Date = new Date()
+): void {
+  // No usable bounds, or an inverted window (minTime after maxTime): an
+  // envelope that never expires, or whose bounds contradict each other, is
+  // not one this server built — structural, so the generic 401.
+  if (!bounds || bounds.maxTime <= 0 || bounds.minTime > bounds.maxTime) {
+    invalidChallenge();
+  }
+
+  const currentSeconds = nowSeconds(now);
+
+  if (bounds.maxTime + CLOCK_SKEW_TOLERANCE_SECONDS <= currentSeconds) {
+    expiredChallenge();
+  }
+  if (bounds.minTime > currentSeconds + CLOCK_SKEW_TOLERANCE_SECONDS) {
+    invalidChallengeWindow("not_yet_valid");
+  }
+  if (
+    bounds.maxTime >
+    bounds.minTime + CHALLENGE_VALIDITY_SECONDS + CLOCK_SKEW_TOLERANCE_SECONDS
+  ) {
+    invalidChallengeWindow("window_too_long");
+  }
+}
+
 /** Build an unsigned challenge for a client account to sign. */
 export function buildChallenge(account: string): {
   transaction: string;
@@ -207,24 +280,12 @@ function validateChallengeEnvelope(tx: Transaction, clientAccountId: string): Ti
   );
   if (!bounds || bounds.maxTime <= 0) invalidChallenge();
 
-  // Validate the effective window rather than requiring an exact duration: the
-  // builder sets minTime to "now", and a wallet with a slightly fast or slow
-  // clock must still authenticate. The same bounded skew tolerance used for
-  // transaction intents applies, so a genuinely stale or not-yet-valid
-  // challenge is still rejected.
-  const now = nowSeconds();
-  if (bounds.maxTime + CLOCK_SKEW_TOLERANCE_SECONDS <= now) {
-    // The envelope is one we issued, correctly shaped, whose window has
-    // closed. Expired — the one failure a client can fix without debugging.
-    expiredChallenge();
-  }
-  if (
-    bounds.minTime > now + CLOCK_SKEW_TOLERANCE_SECONDS ||
-    bounds.maxTime >
-      bounds.minTime + CHALLENGE_VALIDITY_SECONDS + CLOCK_SKEW_TOLERANCE_SECONDS
-  ) {
-    invalidChallenge();
-  }
+  // From here the envelope is known to be one this server signed, so a closed
+  // window is reported as CHALLENGE_EXPIRED and a window that has not opened
+  // (or that outlives the validity this server issues) with its own codes.
+  // The checks live in validateChallengeTimeBounds — the explicit, directly
+  // testable statement of the challenge-expiration contract.
+  validateChallengeTimeBounds(bounds);
 
   const operations = tx.operations as ChallengeOperation[];
   if (operations.length === 0) invalidChallenge();
@@ -414,13 +475,14 @@ async function consumeChallenge(params: {
  * Verify a signed challenge and return the authenticated client public key.
  *
  * Rejects — always with a 401 — challenges that are malformed, expired (code
- * CHALLENGE_EXPIRED), not yet valid, built for the wrong network, home domain,
- * web auth domain, or server account, signed by the wrong client (or not at
- * all), structurally unlike a challenge this server issued, or already
- * redeemed. Signature failures report a distinct message from expiry so a
- * client with a correctly-built but unsigned envelope retries the signature;
- * every other failure stays the generic UNAUTHORIZED with one uniform
- * message, so rejections cannot be probed for which check failed.
+ * CHALLENGE_EXPIRED), not yet valid (CHALLENGE_NOT_YET_VALID), valid longer
+ * than this server issues (CHALLENGE_WINDOW_TOO_LONG), built for the wrong
+ * network, home domain, web auth domain, or server account, signed by the
+ * wrong client (or not at all), structurally unlike a challenge this server
+ * issued, or already redeemed. Signature failures report a distinct message
+ * from expiry so a client with a correctly-built but unsigned envelope retries
+ * the signature; every other failure stays the generic UNAUTHORIZED with one
+ * uniform message, so rejections cannot be probed for which check failed.
  */
 export async function verifyChallenge(signedXdr: string): Promise<string> {
   return (await authenticateChallenge(signedXdr)).account;

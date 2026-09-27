@@ -368,6 +368,16 @@ Retry budgets are exponential with jitter and fully configurable via env vars
 - `WORKER_ANCHOR_MAX_ATTEMPTS` (default 5), `WORKER_ANCHOR_RETRY_INITIAL_DELAY_MS`
   (default 5000), `WORKER_ANCHOR_RETRY_MAX_DELAY_MS` (default 120000),
   `WORKER_ANCHOR_RETRY_JITTER_RATIO` (default 0.25)
+- `WORKER_CYCLE_TASK_MAX_ATTEMPTS` (default 3), `WORKER_CYCLE_TASK_RETRY_INITIAL_DELAY_MS`
+  (default 500), `WORKER_CYCLE_TASK_RETRY_MAX_DELAY_MS` (default 10000) — retries
+  for the *cycle tasks* themselves (issue #708). A sweep that throws a transient
+  database or Horizon error is retried in-cycle with exponential backoff;
+  permanent and indeterminate failures are left to the next cycle. A task whose
+  budget is exhausted is dead-lettered as a critical log line for that cycle
+  while its sibling tasks continue.
+- `WORKER_HEALTH_UNHEALTHY_THRESHOLD` (default 3) — consecutive failed cycles
+  before the per-cycle `worker_health` heartbeat reports `healthy: false` and a
+  critical health line is emitted.
 
 ## How it works
 
@@ -375,6 +385,18 @@ Retry budgets are exponential with jitter and fully configurable via env vars
 `POST /auth/challenge` builds a challenge transaction signed by the server key.
 The wallet signs it; `POST /auth/verify` validates the signature (handling
 unfunded accounts via the master key), upserts the user, and returns a JWT.
+
+Challenge transactions carry a **strictly validated validity window**: the
+envelope's own `minTime`/`maxTime` are checked against server time with a
+bounded 30-second clock-skew tolerance. A challenge whose `maxTime` has elapsed
+is rejected with 401 `CHALLENGE_EXPIRED` (the remedy is to request and sign a
+fresh one); one whose `minTime` has not been reached returns
+`CHALLENGE_NOT_YET_VALID`, and a window longer than the 300s validity the
+server issues returns `CHALLENGE_WINDOW_TOO_LONG`. All other verification
+failures stay the generic 401 `UNAUTHORIZED`, so rejections cannot be probed
+for which structural check failed. Challenges are single-use (durable replay
+detection), and the worker's challenge cleanup purges replay records once
+their window closes, keeping them for 24h forensics before deletion.
 
 ### Settlement
 1. `POST /expenses/:id/settle` (or `POST /groups/:id/settlements`) builds an

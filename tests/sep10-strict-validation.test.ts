@@ -261,19 +261,28 @@ describe("timebounds", () => {
     await expect(verifyChallenge(xdrOf(tx))).rejects.toMatchObject(UNAUTHORIZED);
   });
 
-  it("rejects a challenge that starts beyond the 30s clock-skew tolerance", async () => {
+  // Issue #709: a window that has not opened (or that outlives the validity
+  // this server issues) gets its own 401 code instead of the generic
+  // UNAUTHORIZED, so clients can tell temporal mismatches from structural ones.
+  it("rejects a challenge that starts beyond the 30s clock-skew tolerance as CHALLENGE_NOT_YET_VALID", async () => {
     const client = Keypair.random();
     const start = nowS() + 120; // inside the SDK's grace, outside ours
     const tx = challenge({ client, timebounds: { minTime: start, maxTime: start + 300 } });
 
-    await expect(verifyChallenge(xdrOf(tx))).rejects.toMatchObject(UNAUTHORIZED);
+    await expect(verifyChallenge(xdrOf(tx))).rejects.toMatchObject({
+      status: 401,
+      code: "CHALLENGE_NOT_YET_VALID",
+    });
   });
 
-  it("rejects a window longer than the validity this server issues", async () => {
+  it("rejects a window longer than the validity this server issues as CHALLENGE_WINDOW_TOO_LONG", async () => {
     const client = Keypair.random();
     const tx = challenge({ client, timebounds: { minTime: nowS(), maxTime: nowS() + 3600 } });
 
-    await expect(verifyChallenge(xdrOf(tx))).rejects.toMatchObject(UNAUTHORIZED);
+    await expect(verifyChallenge(xdrOf(tx))).rejects.toMatchObject({
+      status: 401,
+      code: "CHALLENGE_WINDOW_TOO_LONG",
+    });
   });
 
   it("accepts a challenge inside the skew tolerance after maxTime", async () => {

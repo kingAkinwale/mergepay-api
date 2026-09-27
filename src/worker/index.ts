@@ -52,6 +52,7 @@ import {
 import { pollForConfirmation } from "../services/horizon-confirm";
 import { settlementPaymentIntent } from "../services/settlement-xdr";
 import { checkSettlementPreflight } from "../services/settlement-preflight";
+import { recordStatusTransitionInTransaction } from "../services/status-history";
 import {
   classifySettlementFailure,
   type SettlementFailureCategory,
@@ -79,6 +80,7 @@ import {
 import { reconcileAllTreasuryBalances } from "../services/treasuryService";
 import { startReconciliation } from "./reconciliation";
 import { cleanupChallenges } from "./tasks/cleanup-challenges";
+import { syncPendingTransactionStatuses } from "./tasks/tx-status-sync";
 import { acquireWorkerLease, releaseWorkerLease } from "../services/worker-lock";
 import {
   type CorrelationContext,
@@ -202,24 +204,32 @@ async function scheduleRetry(params: {
   const nextAttemptAt = new Date(Date.now() + delayMs);
   const leaseExpiresAt = new Date(nextAttemptAt.getTime() + config.WORKER_LEASE_TIMEOUT_MS);
 
-  await prisma.settlement.update({
-    where: { id: job.id },
-    data: {
-      retryCount: attempt,
-      nextAttemptAt,
-      errorCategory: category,
-      failureReason: reason,
-      leaseExpiresAt,
-    },
-  });
+  // The retry bookkeeping, the status-history entry, and the backoff decision
+  // describe one retry event; persist them in a single interactive transaction
+  // so a crash (or a database hiccup) between the writes can never leave a row
+  // whose retryCount, failure reason, and history disagree. A failure anywhere
+  // rolls both writes back and propagates: the worker's batch loop releases
+  // the lease and the next cycle re-claims the job from a consistent state.
+  await prisma.$transaction(async (tx) => {
+    await tx.settlement.update({
+      where: { id: job.id },
+      data: {
+        retryCount: attempt,
+        nextAttemptAt,
+        errorCategory: category,
+        failureReason: reason,
+        leaseExpiresAt,
+      },
+    });
 
-  await recordStatusTransition({
-    entityType: "settlement",
-    entityId: job.id,
-    newStatus: job.status,
-    reason,
-    source: "worker",
-  }).catch(() => undefined);
+    await recordStatusTransitionInTransaction(tx as never, {
+      entityType: "settlement",
+      entityId: job.id,
+      newStatus: job.status,
+      reason,
+      source: "worker",
+    });
+  });
 
   loggerWithContext(log, ctx).warn(
     {
@@ -362,6 +372,10 @@ async function confirmSubmission(params: {
     nextAttemptAt: null,
   });
 
+  // Best-effort, like `audit` everywhere outside a caller-owned transaction:
+  // the transition above already committed with its own atomic audit record,
+  // so this informational line must never turn a *completed* submission into
+  // a failed job.
   await audit({
     userId: null,
     groupId: job.groupId,
@@ -704,10 +718,12 @@ export async function recoverStaleSettlements(): Promise<number> {
   const now = new Date();
   const { count } = await prisma.settlement.updateMany({
     where: {
-      // pending_confirmation is included: its reconciliation runs under the
-      // same lease regime, so a crash mid-check must free the row the same way
-      // a crash mid-submission does.
-      status: { in: [...SUBMITTABLE_STATUSES, "pending_confirmation"] },
+      // pending_confirmation and needs_review are included: their
+      // reconciliation runs under the same lease regime, so a crash mid-check
+      // must free the row the same way a crash mid-submission does.
+      status: {
+        in: [...SUBMITTABLE_STATUSES, "pending_confirmation", "needs_review"],
+      },
       leaseExpiresAt: { lt: now },
     },
     data: { claimedBy: null, claimedAt: null, leaseExpiresAt: null },
@@ -723,17 +739,25 @@ export async function recoverStaleSettlements(): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
-// pending_confirmation reconciliation
+// pending_confirmation + needs_review reconciliation
 // ---------------------------------------------------------------------------
 
 /** The settlement statuses the reconciliation job owes a Horizon check. */
-const RECONCILABLE_STATUSES = ["pending_confirmation"] as const;
+// pending_confirmation: the hash's confirmation is still being verified under
+//   the bounded retry budget in reconcileSingleSettlement.
+// needs_review: a submission whose on-chain outcome could not be observed
+//   (Horizon had no record yet, or stopped answering — see confirmSubmission).
+//   The hash is recorded, so the same read-only Horizon check applies: found
+//   and successful → confirmed, found and failed → failed, still silent →
+//   demoted to pending_confirmation where the retry budget governs.
+const RECONCILABLE_STATUSES = ["pending_confirmation", "needs_review"] as const;
 
 /**
- * Take exclusive ownership of a pending-confirmation reconciliation.
+ * Take exclusive ownership of a pending-confirmation or needs-review
+ * reconciliation.
  *
  * Same conditional-update lease as settlement submission: the row must still
- * be in `pending_confirmation`, still be on the attempt this worker read, and
+ * be in a reconcilable status, still be on the attempt this worker read, and
  * must not carry a live lease. Two workers racing on one row produce exactly
  * one update with `count === 1`.
  */
@@ -764,9 +788,23 @@ async function claimPendingConfirmation(job: {
 }
 
 /**
- * One cycle of pending_confirmation reconciliation: pick up every settled-in
- * question row, claim it, ask Horizon which of the three outcomes it reached,
- * and let the state machine persist it.
+ * One cycle of pending-confirmation/needs-review reconciliation: pick up
+ * every settlement whose on-chain outcome is unresolved — a submitted
+ * transaction not yet confirmed (`pending_confirmation`) or one whose
+ * confirmation response was lost (`needs_review`) — claim it, ask Horizon
+ * which of the three outcomes it reached, and let the state machine persist
+ * it.
+ *
+ * Issue #541: `needs_review` rows were never revisited before this job
+ * covered them. A settlement that reached `needs_review` — submitted, hash
+ * recorded, but Horizon went quiet before pollForConfirmation could report
+ * an outcome — was terminal in practice: the API could not confirm it and
+ * nothing ever asked Horizon again, leaving an actually-settled expense
+ * stuck as unsettled. Both statuses are the same question ("did this hash
+ * land?") with an answer only Horizon holds, so both are reconciled here.
+ * One cycle of pending_confirmation / needs_review reconciliation: pick up
+ * every row that owes an on-chain answer, claim it, ask Horizon which of the
+ * three outcomes it reached, and let the state machine persist it.
  *
  * A Horizon lookup that comes back empty is deliberately *not* a resolution:
  * the transaction was submitted but is not on the ledger yet, so the row keeps
@@ -806,6 +844,11 @@ export async function reconcilePendingSettlements(): Promise<void> {
   for (const row of rows) {
     if (isShuttingDown) break;
 
+    // Hashless rows have nothing to check against Horizon. The candidate query
+    // already filters on a recorded hash; this guard keeps the loop safe even
+    // if that filter and this loop ever drift apart.
+    if (!row.stellarTxHash) continue;
+
     if (!(await claimPendingConfirmation(row))) continue;
 
     const ctx = jobContext("reconciliation", row.id);
@@ -819,10 +862,12 @@ export async function reconcilePendingSettlements(): Promise<void> {
           stellarTxHash: row.stellarTxHash,
           retryCount: row.retryCount,
           shortCode: row.shortCode,
+          expenseId: row.expenseId,
           amount: String(row.amount),
           assetCode: row.assetCode,
           assetIssuer: row.assetIssuer,
           destinationPublicKey: row.to.stellarPublicKey,
+          status: row.status,
         },
         RECONCILIATION_MAX_RETRIES,
         ctx
@@ -855,7 +900,7 @@ export async function reconcilePendingSettlements(): Promise<void> {
       failed: outcomes.failed,
       stillPending: outcomes.pending,
     },
-    "reconciled pending_confirmation settlements against Horizon"
+    "reconciled pending_confirmation and needs_review settlements against Horizon"
   );
 }
 
@@ -943,11 +988,14 @@ async function reconcileSingleAnchor(
     // no retry can change (rejected a request, returned garbage), so move the
     // session to error rather than burning the retry budget on it.
     if (result.errorCategory === "permanent") {
+      // The status_history row is written inside the transition's own
+      // transaction, only if the transition actually lands.
       await applyAnchorSessionTransition({
         sessionId: job.id,
         nextStatus: "error",
         source: "poll",
         expectedCurrentStatus: job.status,
+        reason,
         extraData: {
           lastPolledAt: now,
           failureReason: reason,
@@ -956,13 +1004,6 @@ async function reconcileSingleAnchor(
           retryCount: 0,
         } as never,
       });
-      await recordStatusTransition({
-        entityType: "anchor_session",
-        entityId: job.id,
-        newStatus: "error",
-        reason,
-        source: "worker",
-      }).catch(() => undefined);
       jobLog.error(
         {
           jobType: "anchor",
@@ -1006,10 +1047,10 @@ async function reconcileSingleAnchor(
   }
 
   // ── unknown anchor status ────────────────────────────────────────────────
-  // A recognised-but-unknown raw status maps to pending_anchor and stays
-  // retryable. Emit an explicit, operationally useful entry so operators can
-  // spot a future anchor that introduced a status we cannot classify — but
-  // never treat it as a failure or overwrite a terminal state.
+  // A status outside the SEP-24 set is not a failure, but it is not a state
+  // Mergepay can interpret either, so it is never persisted: the session
+  // keeps its last known status and stays eligible for the next poll. The
+  // warning lets operators spot an anchor that introduced a new status.
   if (result.recognized === false) {
     jobLog.warn(
       {
@@ -1017,11 +1058,22 @@ async function reconcileSingleAnchor(
         jobId: job.id,
         attempt,
         outcome: "retry_scheduled",
-        category: result.category ?? "unknown",
-        status: result.status,
+        localStatus: job.status,
+        rawStatus: result.rawStatus,
       },
-      `anchor reported an unrecognized SEP-24 status '${result.rawStatus}' — kept pending and will keep polling`
+      "anchor reported an unrecognized SEP-24 status — kept the current state and will keep polling"
     );
+    await prisma.anchorSession.update({
+      where: { id: job.id },
+      data: {
+        lastPolledAt: now,
+        failureReason: null,
+        errorCategory: null,
+        nextAttemptAt: null,
+        retryCount: 0,
+      },
+    });
+    return;
   }
 
   // ── status unchanged ─────────────────────────────────────────────────────
@@ -1069,6 +1121,8 @@ async function reconcileSingleAnchor(
     nextStatus: result.status,
     source: "poll",
     expectedCurrentStatus: job.status,
+    rawStatus: result.rawStatus ?? undefined,
+    reason: result.status === "error" ? result.message : undefined,
     extraData: {
       lastPolledAt: now,
       failureReason: result.status === "error" ? result.message ?? null : null,
@@ -1095,14 +1149,6 @@ async function reconcileSingleAnchor(
     );
     return;
   }
-
-  await recordStatusTransition({
-    entityType: "anchor_session",
-    entityId: job.id,
-    newStatus: result.status,
-    reason: result.status === "error" ? result.message ?? undefined : undefined,
-    source: "worker",
-  }).catch(() => undefined);
 
   jobLog.info(
     {
@@ -1294,6 +1340,10 @@ export async function runWorkerCycle(): Promise<void> {
     processSubmittedSettlements(),
     reconcileAnchors(),
     reconcilePendingSettlements(),
+    // Read-only status sync over pending transactions neither sibling claims:
+    // settlements whose confirmation poll was interrupted, and treasury
+    // intents someone may have submitted from their own wallet (issue #355).
+    syncPendingTransactionStatuses(),
     reconcileAllTreasuryBalances(),
     expireInvites(),
     deliverPendingWebhooks(),
@@ -1376,6 +1426,11 @@ export async function startWorker(): Promise<() => Promise<void>> {
           { jobType: "worker_cycle", outcome: "shutdown_drain_timeout" },
           "in-flight job outran the drain budget, leaving leases to expire"
         );
+        // Leases stay claimed, but the process is on its way out regardless:
+        // the connection pool must still be released so a restart never
+        // inherits dangling database connections.
+        await prisma.$disconnect();
+        log.info({ jobType: "worker_cycle", signal, outcome: "database_disconnected" }, "database disconnected");
         return;
       }
 
@@ -1392,6 +1447,7 @@ export async function startWorker(): Promise<() => Promise<void>> {
         }),
       ]);
       await prisma.$disconnect();
+      log.info({ jobType: "worker_cycle", signal, outcome: "database_disconnected" }, "database disconnected");
 
       log.info({ jobType: "worker_cycle", signal, outcome: "shutdown_complete" }, "worker claims released");
     } catch (error) {

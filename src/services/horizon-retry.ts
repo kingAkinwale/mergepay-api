@@ -75,6 +75,23 @@ export function classifyHorizonError(error: unknown): HorizonErrorCategory {
     if (status >= 400) return "permanent";
   }
 
+  // Raw HTTP status on the error itself, in either shape it arrives:
+  // the Horizon SDK rejects with e.response.status, and fetch-shaped
+  // errors carry e.status. Checked before the response body so a 4xx
+  // that happens to carry a result-codes body is still honoured as
+  // "the upstream refused this request" — retrying a 400 identically
+  // only multiplies load and delays the caller's error (issue #531).
+  if (error && typeof error === "object") {
+    const e = error as { response?: { status?: number }; status?: number };
+    const httpStatus = e.response?.status ?? e.status;
+    if (typeof httpStatus === "number") {
+      if (httpStatus === 408) return "transient";
+      if (httpStatus === 429) return "transient";
+      if (httpStatus >= 500) return "transient";
+      if (httpStatus >= 400) return "permanent";
+    }
+  }
+
   // Horizon SDK error shapes — the response body may carry result_codes.
   const response = extractResponse(error);
   if (response) {
@@ -234,6 +251,8 @@ export function isRetrySuccess<T>(
  *   - `policy` — retry policy, defaults to {@link HORIZON_RETRY_POLICY}
  *   - `beforeRetry` — hook called before each retry with the error and attempt
  *     number; return `false` to abort without retrying
+ *   - `onRetry` — callback called with the error, failed attempt, and delay
+ *     before each retry
  *   - `delay` — injectable delay, for tests
  * @returns A {@link HorizonRetryOutcome} — `{ ok: true, value }` on success,
  *   `{ ok: false, lastError, attempts }` when a permanent error, an aborted
@@ -246,6 +265,7 @@ export async function withHorizonRetry<T>(
     classify?: (error: unknown) => HorizonErrorCategory;
     policy?: HorizonRetryPolicy;
     beforeRetry?: (error: unknown, attempt: number) => Promise<boolean | void>;
+    onRetry?: (error: unknown, attempt: number, delayMs: number) => void;
     delay?: (ms: number) => Promise<void>;
   } = {}
 ): Promise<HorizonRetryOutcome<T>> {
@@ -253,6 +273,7 @@ export async function withHorizonRetry<T>(
     classify = classifyHorizonError,
     policy = HORIZON_RETRY_POLICY,
     beforeRetry,
+    onRetry,
     delay = defaultDelay,
   } = options;
 
@@ -287,6 +308,7 @@ export async function withHorizonRetry<T>(
 
       // Backoff with jitter.
       const delayMs = horizonRetryDelayMs(attempt, policy);
+      onRetry?.(error, attempt, delayMs);
       await delay(delayMs);
     }
   }

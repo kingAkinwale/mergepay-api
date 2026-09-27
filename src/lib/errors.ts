@@ -112,6 +112,14 @@ export const ErrorCode = {
   ALREADY_SETTLED: "ALREADY_SETTLED",
   EXPENSE_SETTLED: "EXPENSE_SETTLED",
   LAST_ADMIN: "LAST_ADMIN",
+  /**
+   * 409 — a unique constraint rejected the write, so a record with these values
+   * already exists. Distinct from the state codes above, which name a workflow
+   * the caller can inspect, and from a bare CONFLICT: here the request is
+   * well-formed and the remedy is a different value, not a different action.
+   * See src/lib/prisma-error.ts.
+   */
+  DUPLICATE_RECORD: "DUPLICATE_RECORD",
   // 429
   RATE_LIMITED: "RATE_LIMITED",
   // 500
@@ -125,43 +133,29 @@ export const ErrorCode = {
    * a transient dependency failure. See src/lib/provider-error.ts.
    */
   PROVIDER_REJECTED: "PROVIDER_REJECTED",
+  // 503 — a dependency this process needs is unavailable, so the request could
+  // not be attempted at all. Used for the database being unreachable, refused,
+  // or timed out — the same condition /health already reports as not-ready, and
+  // distinct from UPSTREAM_ERROR, which is a third-party HTTP dependency. See
+  // src/lib/prisma-error.ts.
+  SERVICE_UNAVAILABLE: "SERVICE_UNAVAILABLE",
 } as const;
 
 export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];
 
-/**
- * Application error with a stable machine-readable code, HTTP status,
- * optional structured details, and an optional correlation request ID.
- *
- * The `requestId` is injected by the central error handler — callers do not
- * need to set it.
- */
-export class AppError extends Error {
-  /** HTTP status code (e.g. 404). */
-  readonly status: number;
-  /** Mirror of `status` — Fastify reads `statusCode` on error objects. */
-  readonly statusCode: number;
-  /** Machine-readable error code string (e.g. "NOT_FOUND"). */
-  readonly code: string;
-  /** Structured detail payload (e.g. Zod validation issues). */
-  readonly details?: unknown;
-  /** Correlation ID injected by the error handler, not set by callers. */
-  requestId?: string;
+export {
+  AppError,
+  NotFoundError,
+  ValidationError,
+  UnauthorizedError,
+  ForbiddenError,
+  ConflictError,
+  BadRequestError,
+  InternalServerError,
+} from "../errors/app-error";
 
-  constructor(
-    status: number,
-    code: string,
-    message: string,
-    details?: unknown,
-  ) {
-    super(message);
-    this.name = "AppError";
-    this.status = status;
-    this.statusCode = status;
-    this.code = code;
-    this.details = details;
-  }
-}
+import { AppError } from "../errors/app-error";
+
 
 /** Factory helpers — mirrors the original `Errors` object in src/errors.ts. */
 export const Errors = {

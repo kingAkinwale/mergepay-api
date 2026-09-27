@@ -49,6 +49,7 @@ import { config } from "../config";
 import { Errors } from "../errors";
 import { prisma } from "../db";
 import { stellar } from "./stellar";
+import { buildTreasuryPaymentXdr } from "./treasury-stellar";
 import { audit, auditTx } from "./audit";
 import { AuditAction } from "./audit-actions";
 
@@ -150,7 +151,7 @@ export const treasuryProposalsService = {
       }
 
       const textMemo = params.memo ?? `MP:${shortCodeRunes()}`;
-      xdr = stellar.buildPayment({
+      xdr = buildTreasuryPaymentXdr({
         sourcePublicKey: treasury.treasuryAccountPublicKey,
         sourceSequence: treasuryAcct.sequence,
         destination: params.destination,
@@ -201,6 +202,10 @@ export const treasuryProposalsService = {
         entityId: created.id,
         metadata: {
           sourceAccount: treasury.treasuryAccountPublicKey,
+          // The hash of the exact unsigned envelope this proposal binds every
+          // later approval to. Recorded at creation so the audit trail can be
+          // tied to the on-chain intent without re-deriving it from the XDR.
+          txHash: created.txHash,
           destination: params.destination,
           amount: params.amount,
           assetCode: params.assetCode,
@@ -485,6 +490,9 @@ export const treasuryProposalsService = {
             entityId: proposal.id,
             metadata: {
               signerPublicKey: pk,
+              // The transaction the signature is bound to — the same hash
+              // every approval is verified against.
+              txHash: proposal.txHash,
               signatureCount: verified.length,
               threshold: proposal.threshold,
             },

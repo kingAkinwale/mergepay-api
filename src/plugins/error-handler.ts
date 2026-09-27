@@ -4,6 +4,8 @@ import { ZodError } from "zod";
 import { AppError } from "../lib/errors";
 import { formatErrorResponse } from "../utils/error-response";
 import { toRequestLimitError } from "../lib/request-limits";
+import { toPrismaError } from "../lib/prisma-error";
+import { ProviderError } from "../lib/provider-error";
 import { TimeoutError, TransportError, toProviderError } from "../services/timeout";
 
 function isHorizonError(error: unknown): error is Error & {
@@ -98,6 +100,9 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
     }
 
     if (err instanceof AppError) {
+      if (err instanceof ProviderError && err.retryAfterSeconds !== undefined) {
+        reply.header("Retry-After", String(err.retryAfterSeconds));
+      }
       return reply.code(err.status).send(
         formatErrorResponse(err.code, err.message, requestId, err.details)
       );
@@ -129,6 +134,37 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
       );
     }
 
+    // A statement the database rejected: a unique constraint, a dangling
+    // foreign key, a missing required field, or a database this process cannot
+    // reach. These used to reach the generic 500 below, which told the caller
+    // that its own bad request (or a duplicate submission) was a bug in this
+    // process. See src/lib/prisma-error.ts.
+    const prismaError = toPrismaError(err);
+    if (prismaError) {
+      // The response carries the fixed, client-safe message; the log keeps the
+      // original error so an operator still sees the constraint and the driver's
+      // text. A duplicate submission is a client mistake rather than an
+      // incident, so it is logged below warn; an unreachable database, a
+      // deadlock, or a failed statement is not.
+      const level =
+        prismaError.retryable || prismaError.status >= 500 ? "warn" : "debug";
+      req.log[level](
+        {
+          err,
+          requestId,
+          errorCode: prismaError.code,
+          prismaCode: prismaError.prismaCode,
+          // Postgres constraint names are internal, so they are logged rather
+          // than sent in the response body.
+          constraint: prismaError.constraint,
+        },
+        "Database error"
+      );
+      return reply.code(prismaError.status).send(
+        formatErrorResponse(prismaError.code, prismaError.message, requestId, prismaError.details)
+      );
+    }
+
     const upstreamStatus =
       (err as unknown as Record<string, unknown>).response && typeof (err as any).response === "object"
         ? (err as any).response.status
@@ -150,8 +186,16 @@ export default fp(async function errorHandlerPlugin(app: FastifyInstance) {
       );
 
       if (upstreamStatus === 429) {
-        return reply.code(429).send(
-          formatErrorResponse("RATE_LIMITED", "Horizon is rate limiting requests. Please retry shortly.", requestId)
+        const converted = toProviderError(err, {
+          provider: "horizon",
+          operation,
+          fallbackMessage: "Horizon is rate limiting requests. Please retry shortly.",
+        });
+        if (converted instanceof ProviderError && converted.retryAfterSeconds !== undefined) {
+          reply.header("Retry-After", String(converted.retryAfterSeconds));
+        }
+        return reply.code(converted.status).send(
+          formatErrorResponse(converted.code, converted.message, requestId, converted.details)
         );
       }
 

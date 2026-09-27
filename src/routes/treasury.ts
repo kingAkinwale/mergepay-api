@@ -7,6 +7,7 @@ import { config } from "../config";
 import { AppError, Errors } from "../errors";
 import { requireUser } from "../plugins/auth";
 import { requireMembership, requireAdmin } from "../services/access";
+import { requireGroupRole } from "../plugins/group-access";
 import { stellar, memoText } from "../services/stellar";
 import { shortCode } from "../services/codes";
 import { audit, auditTx } from "../services/audit";
@@ -30,11 +31,12 @@ import {
 } from "../lib/pagination";
 import { readIdempotencyKey, runIdempotent } from "../services/idempotency";
 import {
-  assertSignedXdrMatchesIntent,
+  buildTreasuryPaymentXdr,
   getTreasuryAccount,
   getTreasuryAccountSnapshot,
   getTreasuryMultisigRequirement,
   hashOfEnvelope,
+  validateTreasurySignedXdr,
 } from "../services/treasury-stellar";
 import {
   validateProposedSignerConfig,
@@ -43,6 +45,7 @@ import {
   type ProposedSignerConfig,
 } from "../services/treasury-validation";
 import { treasurySignerConfigSchema } from "../validations/treasury";
+import { signedXdrRequestSchema } from "../validations/stellar-transaction";
 import { openApiBody, openApiEnvelope, openApiIdParams } from "../lib/openapi";
 
 const stellarAmountSchema = z.string().min(1);
@@ -54,6 +57,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   app.post(
     "/groups/:id/treasury/enable",
     {
+      preHandler: requireGroupRole("admin", { param: "id" }),
       schema: {
         tags: ["Treasury"],
         summary: "Enable group treasury",
@@ -136,6 +140,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   app.get(
     "/groups/:id/treasury",
     {
+      preHandler: requireGroupRole("member", { param: "id" }),
       schema: {
         tags: ["Treasury"],
         summary: "Get group treasury status",
@@ -144,9 +149,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       },
     },
     async (req) => {
-    const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    await requireMembership(id, auth.id);
     const group = await prisma.group.findUnique({ where: { id } });
     if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
       throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
@@ -165,6 +168,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   app.post(
     "/groups/:id/treasury/validate-signers",
     {
+      preHandler: requireGroupRole("admin", { param: "id" }),
       schema: {
         tags: ["Treasury"],
         summary: "Validate treasury signer configuration",
@@ -177,8 +181,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    await requireAdmin(id, auth.id);
-    
+
     const body = treasurySignerConfigSchema.parse(req.body);
 
     const group = await prisma.group.findUnique({ where: { id } });
@@ -219,6 +222,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     "/groups/:id/treasury/deposit",
     {
       ...rateLimited("settlementCreate"),
+      preHandler: requireGroupRole("member", { param: "id" }),
       schema: {
         tags: ["Treasury"],
         summary: "Initiate treasury deposit",
@@ -229,7 +233,6 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    await requireMembership(id, auth.id);
     const body = z
       .object({
         amount: stellarAmountSchema,
@@ -246,7 +249,6 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     validateAsset(body.assetCode, body.assetIssuer ?? null);
 
     const group = await prisma.group.findUnique({ where: { id } });
-    await requireMembership(id, auth.id);
     if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
       throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
     }
@@ -266,7 +268,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         if (!account.exists) {
           throw Errors.badRequest("account_unfunded", "Your account is not funded yet");
         }
-        const xdr = stellar.buildPayment({
+        const xdr = buildTreasuryPaymentXdr({
           sourcePublicKey: auth.stellarPublicKey,
           sourceSequence: account.sequence,
           destination: treasuryKey,
@@ -333,6 +335,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     "/groups/:id/treasury/withdraw",
     {
       ...rateLimited("settlementCreate"),
+      preHandler: requireGroupRole("member", { param: "id" }),
       schema: {
         tags: ["Treasury"],
         summary: "Propose treasury withdrawal",
@@ -343,7 +346,6 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    await requireMembership(id, auth.id);
     const body = z
       .object({
         amount: stellarAmountSchema,
@@ -363,7 +365,6 @@ export default async function treasuryRoutes(app: FastifyInstance) {
     }
 
     const group = await prisma.group.findUnique({ where: { id } });
-    await requireMembership(id, auth.id);
     if (!group?.treasuryEnabled || !group.treasuryAccountPublicKey) {
       throw Errors.badRequest("treasury_disabled", "Treasury is not enabled");
     }
@@ -385,7 +386,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         if (!account.exists) {
           throw Errors.badRequest("treasury_unfunded", "Treasury account is not funded");
         }
-        const xdr = stellar.buildPayment({
+        const xdr = buildTreasuryPaymentXdr({
           sourcePublicKey: treasuryKey,
           sourceSequence: account.sequence,
           destination: body.destination,
@@ -460,12 +461,13 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         summary: "Confirm treasury transaction",
         description: "Submits signatures and confirms execution of a treasury transaction.",
         params: openApiIdParams(),
+        body: openApiBody(signedXdrRequestSchema),
       },
     },
     async (req) => {
     const auth = requireUser(req);
     const { id } = z.object({ id: z.string() }).parse(req.params);
-    const body = z.object({ signedXdr: z.string().min(1) }).parse(req.body);
+    const body = signedXdrRequestSchema.parse(req.body);
     const idempotencyKey = readIdempotencyKey(req.headers);
 
     const ttx = await prisma.treasuryTransaction.findUnique({ where: { id } });
@@ -528,10 +530,6 @@ export default async function treasuryRoutes(app: FastifyInstance) {
         // Validate the submitted signed XDR is for the exact intended
         // transaction. This prevents a signer from submitting a signature
         // for a modified (attacker-changed) transaction.
-        if (fresh.intendedTxHash) {
-          assertSignedXdrMatchesIntent(body.signedXdr, fresh.intendedTxHash);
-        }
-
         let hash: string;
         try {
           const expected = {
@@ -543,6 +541,18 @@ export default async function treasuryRoutes(app: FastifyInstance) {
             expiresAt: fresh.expiresAt,
             resource: "treasury transaction",
           };
+          if (fresh.intendedTxHash) {
+            const validation = validateTreasurySignedXdr(body.signedXdr, {
+              ...expected,
+              skipSourceSignatureCheck: Boolean(multisig),
+            });
+            if (validation.tx.hash().toString("hex") !== fresh.intendedTxHash) {
+              throw Errors.badRequest(
+                "xdr_mismatch",
+                "Submitted signed XDR does not match the intended transaction"
+              );
+            }
+          }
           hash = multisig
             ? await stellar.submitMultisigPayment(body.signedXdr, expected, multisig)
             : await stellar.submitPayment(body.signedXdr, expected);
@@ -591,6 +601,7 @@ export default async function treasuryRoutes(app: FastifyInstance) {
   app.get(
     "/groups/:id/treasury/history",
     {
+      preHandler: requireGroupRole("member", { param: "id" }),
       schema: {
         tags: ["Treasury"],
         summary: "Get treasury transaction history",
@@ -599,10 +610,8 @@ export default async function treasuryRoutes(app: FastifyInstance) {
       },
     },
     async (req) => {
-    const auth = requireUser(req);
     const { id: groupId } = z.object({ id: z.string().min(1).max(64) }).parse(req.params);
     const { cursor, limit, order } = paginationQuerySchema.parse(req.query ?? {});
-    await requireMembership(groupId, auth.id);
 
     const position = requireCursor(cursor);
 

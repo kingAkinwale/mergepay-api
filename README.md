@@ -111,6 +111,68 @@ npm run dev                   # API on :4000
 npm run worker                # background reconciliation worker (separate shell)
 ```
 
+### Local database setup
+
+For local development, use PostgreSQL 14+ and Node.js 20+. Start PostgreSQL,
+then create the `mergepay` database once:
+
+```bash
+createdb mergepay
+```
+
+Copy `.env.example` to `.env` if you have not already, and set `DATABASE_URL`
+to a connection string for that database, for example:
+
+```env
+DATABASE_URL=postgresql://postgres:your-password@localhost:5432/mergepay
+```
+
+Generate the Prisma client and apply the migrations to initialize the schema:
+
+```bash
+npm run prisma:generate
+npm run prisma:migrate
+```
+
+To add the local development seed data, run:
+
+```bash
+npm run db:seed
+```
+
+### Seed data
+
+`npm run db:seed` runs [prisma/seed.ts](prisma/seed.ts) and populates a
+disposable demo dataset so API endpoints can be exercised immediately, without
+manual bootstrapping. The script is **idempotent**: every row is written with
+an upsert keyed by a deterministic id (or another natural unique key), so
+running it again never throws a unique constraint violation and never
+duplicates data. A re-run also restores any seed-owned row to its canonical
+demo values. Rows left behind by older versions of the seed (random ids) are
+untouched — delete them by hand if you want a clean slate.
+
+| Row | Details |
+| --- | --- |
+| Users | `Ada`, `Kola`, `Zo`, `Tunde` — deterministic testnet keypairs |
+| Groups | `Lagos Trip` (4 members) and `Flat 12B` (3 members, treasury enabled) |
+| Expenses | `Dinner` (equal), `Airport transfer` (equal), `Groceries` (custom split), `Wi-Fi subscription` (equal) |
+| Settlements | `SEEDSETTLE` confirmed, `SEEDQUEUE2` pending signature, `SEEDRETRY2` failed and retryable — each with status history |
+| Treasury | confirmed deposit `SEEDTREASR` (100 XLM) and pending deposit `SEEDGRANT2` (50 XLM) in `Flat 12B` |
+| Invite | code `SEEDCLUB` for `Lagos Trip` (max 10 uses) |
+
+The demo accounts are derived from public labels (`mergepay:demo:…`), so their
+secret keys are recomputable by anyone: use them only in local or testnet
+databases and never fund them with anything of value. To sign demo
+transactions (for example in Stellar Laboratory), print the secret seeds with:
+
+```bash
+SEED_PRINT_SECRETS=1 npm run db:seed
+```
+
+Seeded intents carry `expiresAt = null`, which the API reads as "no recorded
+deadline", so demo rows stay actionable instead of expiring while the database
+sits idle.
+
 New to the codebase? The typing standards enforced across `src/` are documented in [TypeScript strict mode](#typescript-strict-mode).
 
 ## Environment variables
@@ -128,10 +190,32 @@ See [.env.example](.env.example). Key ones:
 | `STELLAR_NETWORK` | `testnet` or `public` |
 | `HORIZON_URL` | Horizon server |
 | `SEP10_SIGNING_SECRET` | Server's SEP-10 signing key (`npm run gen:sep10key`) |
-| `WEB_URL` | Frontend origin (CORS + invite links) |
+| `WEB_URL` | Frontend origin allow-list for CORS + invite links (comma-separated; `*` for local dev) |
 | `ANCHOR_HOME_DOMAIN` | SEP-24 anchor home domain (default SDF test anchor) |
 | `ANCHOR_WEBHOOK_SECRET` | Shared secret for the anchor webhook |
 | `STABLE_ASSET_CODE` / `STABLE_ASSET_ISSUER` | Stable asset for settlement |
+
+#### CORS configuration
+
+Cross-origin access for the frontend (`mergepay-web`) is configured entirely
+from the environment: `src/app.ts` registers `@fastify/cors` with the options
+built by `src/lib/cors.ts`. Preflights are answered `204` inside the plugin's
+`onRequest` hook — ahead of authentication and rate limiting — because a
+browser never sends an `Authorization` header on an `OPTIONS` probe.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `WEB_URL` | `""` (deny cross-origin) | Origin allow-list, comma-separated; `*` reflects any origin and is for local development only (the shipped `.env.example` sets `*`) |
+| `CORS_ALLOW_CREDENTIALS` | `false` | Whether cross-origin requests may carry credentials; never enable alongside `WEB_URL=*` outside local development |
+| `CORS_ALLOW_METHODS` | `GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS` | Methods advertised on a preflight — restricted to this list, never echoed from the request |
+| `CORS_ALLOW_HEADERS` | `Content-Type,Authorization,X-Requested-With,Idempotency-Key` | Request headers a cross-origin request may send |
+| `CORS_EXPOSE_HEADERS` | `X-Request-ID,X-Correlation-ID,X-RateLimit-*`,`Retry-After` | Response headers made readable to the caller |
+| `CORS_MAX_AGE` | `86400` | Preflight cache lifetime in seconds |
+
+An empty `WEB_URL` denies every cross-origin request while leaving same-origin
+and non-browser clients (no `Origin` header) to the routes' own
+authentication. If `WEB_URL` names a `*.vercel.app` host, preview deployments
+of the frontend (`mergepay-web-*.vercel.app`) are allowed too.
 
 #### Horizon read retries
 
@@ -157,6 +241,7 @@ General retry configuration for safe Horizon and anchor reads (see `src/services
 | `UPSTREAM_RETRY_INITIAL_DELAY_MS` | 200 | Initial delay before first retry |
 | `UPSTREAM_RETRY_MAX_DELAY_MS` | 2000 | Maximum delay cap for exponential backoff |
 | `UPSTREAM_RETRY_JITTER_RATIO` | 0.25 | Fraction of delay applied as random jitter |
+| `HORIZON_RETRY_ON_RATE_LIMIT` | true | Horizon reads in `src/services/stellar.ts` also retry HTTP 429 (honouring `Retry-After` up to `UPSTREAM_RETRY_MAX_DELAY_MS`). Submissions are never retried. |
 
 #### Idempotency configuration
 
@@ -347,6 +432,24 @@ treasury account and, when `treasuryRequiredSigners > 1`, returned in
 **from the anchor**. The wallet signs it; `POST /anchors/sessions/:id/complete`
 exchanges it for an anchor JWT and the interactive deposit/withdraw URL. A signed
 `POST /anchors/webhook` updates session status; the worker also polls.
+
+Status tracking (`src/services/anchor.ts`, `src/services/anchor-status.ts`):
+
+- `anchorService.getTransaction` reads `GET /transaction` and validates it with
+  the Zod schema in `src/services/anchor-schemas.ts`. `id`, `kind` and `status`
+  are required, unknown fields are stripped, and amounts stay decimal strings
+  (a malformed optional field is dropped and logged, never coerced). Failures
+  raise typed errors from `src/services/anchor-errors.ts`, all 502 over HTTP.
+  Each attempt is bounded by `ANCHOR_POLL_TIMEOUT_MS`, and transient failures
+  are retried per `UPSTREAM_RETRY_*`.
+- Every status change goes through `applyAnchorSessionTransition`: a
+  conditional update on the current status plus a `status_history` row and an
+  audit row, all in one transaction. Re-delivering the same status is a no-op,
+  terminal states (`completed`, `refunded`, `expired`, `no_market`,
+  `too_small`, `too_large`; `error` may still become `refunded`) are never
+  walked back, and concurrent writers record the transition exactly once.
+- A status outside the SEP-24 set is logged and ignored. The session keeps its
+  last known state and the worker keeps polling.
 
 ## Endpoints
 

@@ -8,6 +8,7 @@ import path from "node:path";
 import { config } from "./config";
 import { verifyToken } from "./plugins/auth";
 import authPlugin from "./plugins/auth";
+import groupAccessPlugin from "./plugins/group-access";
 import errorHandlerPlugin from "./plugins/error-handler";
 import idempotencyPlugin from "./plugins/idempotency";
 import loggingPlugin from "./plugins/logging";
@@ -32,14 +33,14 @@ import userGroupsRoutes from "./routes/user-groups";
 import healthRoutes from "./routes/health";
 import { getCorrelationId } from "./lib/correlation";
 import { formatErrorResponse } from "./utils/error-response";
-import { rateLimitPolicies } from "./lib/rate-limit";
-import { stellarErrorSerializer } from "./lib/stellar-serializer";
-import { reqSerializer, resSerializer } from "./lib/serializers";
+import { isGlobalRateLimitExempt, rateLimitPolicies } from "./lib/rate-limit";
+import { AppError, ErrorCode } from "./lib/errors";
+import { buildLoggerOptions, nullLogDestination } from "./lib/logger";
+import { buildCorsOptions } from "./lib/cors";
 import { PrismaRateLimitStore } from "./services/rate-limit-store";
 import { getReadiness } from "./services/health";
 import { installMultipartGuard } from "./lib/multipart-guard";
 import { nanoid } from "nanoid";
-import { AppError, ErrorCode } from "./lib/errors";
 
 /**
  * Global-policy key. Unlike the per-route policies (which run on `preHandler`
@@ -65,10 +66,9 @@ function globalRateLimitKey(request: FastifyRequest): string {
  * Build-time overrides.
  *
  * `logger` exists so tests can inject a Pino instance that writes into an
- * in-memory stream: under test the default logger is disabled (see the
- * `config.isTest` branch below), so without an injection point there is
- * nothing for the error-handling tests to assert against. Production callers
- * pass no options and keep the configured logger.
+ * in-memory stream: without an injection point there would be nothing for the
+ * error-handling tests to assert against. Production callers pass no options
+ * and keep the configured logger.
  */
 export interface BuildAppOptions {
   logger?: FastifyServerOptions["logger"];
@@ -80,6 +80,21 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   // Contains a @fastify/busboy defect that turns a truncated multipart body
   // into an uncaught exception. See src/lib/multipart-guard.ts.
   installMultipartGuard();
+
+  // The logger is configured from the shared option set in src/lib/logger.ts so
+  // the request, response, and error serializers apply to every log line this
+  // instance emits — including the "incoming request" / "request completed"
+  // lines Fastify writes itself, which are the ones that would otherwise carry
+  // a raw Authorization header into the log.
+  //
+  // Under test the same configuration is used, only pointed at a destination
+  // that discards its input: the serializers run on every request the suite
+  // makes, so one that throws — or a credential that slips past redaction —
+  // fails `npm test`, while the run itself stays quiet.
+  const loggerOptions = buildLoggerOptions({
+    level: config.LOG_LEVEL,
+    pretty: config.NODE_ENV === "development" && !config.isTest,
+  });
 
   const app = Fastify({
     requestIdHeader: "x-request-id",
@@ -98,41 +113,8 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     logger:
       options.logger ??
       (config.isTest
-        ? false
-        : {
-          level: config.LOG_LEVEL,
-          serializers: {
-            err: stellarErrorSerializer as any,
-            req: reqSerializer as any,
-            res: resSerializer as any,
-          },
-          redact: {
-            paths: [
-              "req.headers.authorization",
-              "req.headers.cookie",
-              "authorization",
-              "cookie",
-              "token",
-              "accessToken",
-              "refreshToken",
-              "signedXdr",
-              "transactionXdr",
-              "privateKey",
-              "secret",
-              "password",
-              "body.token",
-              "body.signedXdr",
-              "body.transactionXdr",
-              "body.privateKey",
-              "body.password",
-            ],
-            censor: "[REDACTED]",
-          },
-          transport:
-            config.NODE_ENV === "development"
-              ? { target: "pino-pretty", options: { colorize: true } }
-              : undefined,
-        }),
+        ? { ...loggerOptions, stream: nullLogDestination() }
+        : loggerOptions),
     bodyLimit: config.JSON_BODY_LIMIT_BYTES,
   });
 
@@ -182,66 +164,47 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     }
   });
 
-  // Security headers via @fastify/helmet. CSP is left permissive for a JSON API:
-  // there is no rendered HTML, so we only lock down the vectors that matter for
-  // an API backend (frame embedding, MIME sniffing, referrer leakage) and let
-  // the SPA on Vercel own its own CSP for its own documents. `frameguard` denies
-  // embedding entirely — the API is never loaded in an <iframe>. `contentSecurityPolicy`
-  // is enabled with a baseline `default-src 'none'` so any accidental inline
-  // content is inert, without breaking JSON clients that only read headers/body.
-  const cspDirectives: Record<string, string[]> = {
-    defaultSrc: ["'none'"],
-    frameAncestors: ["'none'"],
-  };
+  // Security headers via @fastify/helmet.
+  // Explicit production-ready helmet options configured for API security while
+  // ensuring Swagger UI documentation (/docs) remains fully functional.
   await app.register(helmet, {
     contentSecurityPolicy: {
-      directives: cspDirectives,
+      directives: {
+        defaultSrc: ["'self'"],
+        baseUri: ["'self'"],
+        fontSrc: ["'self'", "https:", "data:"],
+        formAction: ["'self'"],
+        frameAncestors: ["'none'"],
+        imgSrc: ["'self'", "data:", "validator.swagger.io"],
+        objectSrc: ["'none'"],
+        scriptSrc: ["'self'", "'unsafe-inline'"],
+        scriptSrcAttr: ["'none'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        upgradeInsecureRequests: [],
+      },
     },
     frameguard: { action: "deny" },
-    // Disabled on purpose: `require-corp` (helmet's default) would force the
-    // SPA's fetch() clients to negotiate CORP headers and break API calls.
-    crossOriginEmbedderPolicy: false,
-    // API responses are always JSON; never let a browser MIME-sniff them.
     noSniff: true,
-    // Don't leak the full URL in the Referer header to third parties.
     referrerPolicy: { policy: "no-referrer" },
-    // Block the page from being used as a cross-origin opener.
+    crossOriginEmbedderPolicy: false,
     crossOriginOpenerPolicy: { policy: "same-origin" },
     crossOriginResourcePolicy: { policy: "cross-origin" },
-    // Harden the connection by opting into HTTPS upgrades where supported.
+    dnsPrefetchControl: { allow: false },
+    ieNoOpen: true,
+    permittedCrossDomainPolicies: { permittedPolicies: "none" },
     hsts: {
       maxAge: 60 * 60 * 24 * 365,
       includeSubDomains: true,
       preload: true,
     },
   });
-  const allowAll = config.WEB_URL === "*";
-  const allowed = config.WEB_URL
-    .split(",")
-    .map((o) => o.trim().replace(/\/+$/, ""))
-    .filter(Boolean);
-  const allowVercelPreviews = allowed.some((o) => o.endsWith(".vercel.app"));
-  const allowMethods = config.CORS_ALLOW_METHODS.split(",").map((m) => m.trim().toUpperCase());
-  const allowHeaders = config.CORS_ALLOW_HEADERS.split(",").map((h) => h.trim());
-  const exposeHeaders = config.CORS_EXPOSE_HEADERS.split(",").map((h) => h.trim());
-  await app.register(cors, {
-    origin: allowAll
-      ? true
-      : (origin, cb) => {
-          if (!origin) return cb(null, true);
-          const normalized = origin.replace(/\/+$/, "");
-          if (allowed.includes(normalized)) return cb(null, true);
-          if (allowVercelPreviews && normalized.endsWith(".vercel.app")) {
-            return cb(null, true);
-          }
-          return cb(null, false);
-        },
-    credentials: config.CORS_ALLOW_CREDENTIALS,
-    methods: allowMethods,
-    allowedHeaders: allowHeaders,
-    exposedHeaders: exposeHeaders,
-    maxAge: config.CORS_MAX_AGE,
-  });
+  // CORS — explicit, environment-driven options built by src/lib/cors.ts
+  // (WEB_URL and the CORS_* variables; see .env.example). Registered here,
+  // after helmet and before rate limiting, so a browser's preflight — which
+  // never carries an Authorization header — is answered 204 inside the plugin's
+  // onRequest hook instead of reaching an auth guard or spending rate-limit
+  // budget it does not need.
+  await app.register(cors, buildCorsOptions(config));
   // Global default limit. Sensitive routes (SEP-10 auth, settlement and
   // treasury submission, anchor initiation and polling) override this with
   // their own bucket — see src/lib/rate-limit.ts for the policy table and the
@@ -253,11 +216,18 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   // (skipOnError), so a database hiccup degrades to "unlimited" rather than
   // blocking all traffic. The default "memory" store is per-process and
   // needs no failure handling of its own.
+  //
+  // errorResponseBuilder must throw an AppError, not a bare body object:
+  // @fastify/rate-limit re-throws whatever this returns, so a plain object
+  // reaches the central error handler without a statusCode and is answered
+  // 500 instead of 429. AppError carries status 429 and the RATE_LIMITED
+  // code, and the handler renders it in the standard error envelope.
   await app.register(rateLimit, {
     global: true,
     max: config.RATE_LIMIT_GLOBAL_MAX,
     timeWindow: config.RATE_LIMIT_GLOBAL_WINDOW_MS,
     keyGenerator: globalRateLimitKey,
+    allowList: isGlobalRateLimitExempt,
     addHeaders: { "x-ratelimit-limit": true, "x-ratelimit-remaining": true, "x-ratelimit-reset": true, "retry-after": true } as any,
     errorResponseBuilder: () =>
       // Must be a real Error (AppError), not a bare payload object:
@@ -314,6 +284,8 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     "/api/treasury/proposals/:id/signatures",
     "/anchors/deposit",
     "/anchors/withdraw",
+    "/api/sep24/deposit",
+    "/api/sep24/withdraw",
     "/anchors/sessions/:id/complete",
     "/anchors/webhook",
     "/api/webhooks/sep24",
@@ -338,6 +310,9 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
 
   await app.register(loggingPlugin);
   await app.register(authPlugin);
+  // Must come after the rate-limit registration above: its onRoute hook
+  // moves each group guard behind the limiter in the route's preHandler chain.
+  await app.register(groupAccessPlugin);
   await app.register(errorHandlerPlugin);
   // Registered with fastify-plugin, so `app.idempotent` is visible to every
   // route plugin below rather than only inside this scope.
